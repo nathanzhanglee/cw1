@@ -130,6 +130,10 @@ static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 #endif
 
 #ifdef CONFIG_SYSCTL
+
+static unsigned int sysctl_entangled_cpu1 = 0;
+static unsigned int sysctl_entangled_cpu2 = 0;
+
 static struct ctl_table sched_fair_sysctls[] = {
 #ifdef CONFIG_CFS_BANDWIDTH
 	{
@@ -151,6 +155,20 @@ static struct ctl_table sched_fair_sysctls[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 #endif /* CONFIG_NUMA_BALANCING */
+{
+.procname = "entangled_cpus_1",
+.data = &sysctl_entangled_cpu1,
+.maxlen = sizeof(unsigned int),
+.mode = 0644,
+.proc_handler = proc_dointvec_minmax,
+},
+{
+.procname = "entangled_cpus_2",
+.data = &sysctl_entangled_cpu2,
+.maxlen = sizeof(unsigned int),
+.mode = 0644,
+.proc_handler = proc_dointvec_minmax,
+},
 };
 
 static int __init sched_fair_sysctl_init(void)
