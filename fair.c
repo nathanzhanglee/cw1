@@ -8973,9 +8973,37 @@ again:
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 
+struct task_struct *get_task_on_cpu(int cpu) {
+    struct rq *rq = cpu_rq(cpu);
+    return rq->curr;               
+}
+
+bool check_if_safe_to_schedule(struct rq *rq) {
+    struct task_struct *current_task = rq->curr;
+    struct task_struct *other_task;
+
+    if (rq->cpu == sysctl_entangled_cpu1) {
+        other_task = get_task_on_cpu(sysctl_entangled_cpu2);
+    } else if (rq->cpu == sysctl_entangled_cpu2) {
+        other_task = get_task_on_cpu(sysctl_entangled_cpu1);
+    } else {
+        return true;
+    }
+
+    if (current_task->cred->uid.val != other_task->cred->uid.val) {
+        return false;
+    }
+
+    return true;
+}
+
 struct task_struct *
 pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
+
+	int entangled_cpu1 = sysctl_entangled_cpu1;
+	int entangled_cpu2 = sysctl_entangled_cpu2;
+
 	struct sched_entity *se;
 	struct task_struct *p;
 	int new_tasks;
@@ -8985,6 +9013,11 @@ again:
 	if (!p)
 		goto idle;
 	se = &p->se;
+
+	if ((rq->cpu == entangled_cpu1 || rq->cpu == entangled_cpu2) && !check_if_safe_to_schedule(rq)) {
+    goto again;  
+}
+
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (prev->sched_class != &fair_sched_class)
