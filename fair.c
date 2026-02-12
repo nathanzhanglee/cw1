@@ -130,6 +130,15 @@ static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 #endif
 
 #ifdef CONFIG_SYSCTL
+static unsigned int sysctl_entangled_cpu1 = 0;
+static unsigned int sysctl_entangled_cpu2 = 0;
+
+static unsigned int entangled_priority_cpu = 0;  /* Which CPU currently has priority */
+static u64 entangled_last_switch_ns = 0;         /* When did we last switch priority */
+static DEFINE_SPINLOCK(entangled_lock);          /* Protect entanglement state */
+
+#define ENTANGLED_TIMEOUT_NS 1000000000ULL       /* 1 second timeout in nanoseconds */
+
 static struct ctl_table sched_fair_sysctls[] = {
 #ifdef CONFIG_CFS_BANDWIDTH
 	{
@@ -151,7 +160,64 @@ static struct ctl_table sched_fair_sysctls[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 #endif /* CONFIG_NUMA_BALANCING */
+{
+		.procname	= "entangled_cpus_1",
+		.data		= &sysctl_entangled_cpu1,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+	},
+	{
+		.procname	= "entangled_cpus_2",
+		.data		= &sysctl_entangled_cpu2,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+	},
 };
+
+/*
+ * Check if we need to flip priority between entangled CPUs.
+ * Call this when a CPU would go idle due to entanglement.
+ */
+static void check_entangled_timeout(int cpu)
+{
+	int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	u64 now = ktime_get_ns();
+	u64 last_switch;
+	unsigned int current_priority;
+	
+	/* No entanglement */
+	if (cpu1 == cpu2)
+		return;
+	
+	/* Not an entangled CPU */
+	if (cpu != cpu1 && cpu != cpu2)
+		return;
+	
+	spin_lock(&entangled_lock);
+	
+	last_switch = entangled_last_switch_ns;
+	current_priority = entangled_priority_cpu;
+	
+	/* Check if timeout exceeded */
+	if (now - last_switch >= ENTANGLED_TIMEOUT_NS) {
+		/* Flip priority to the other CPU */
+		if (current_priority == cpu1)
+			entangled_priority_cpu = cpu2;
+		else
+			entangled_priority_cpu = cpu1;
+		
+		entangled_last_switch_ns = now;
+		
+		/* Trigger reschedule on both CPUs to apply new priority */
+		resched_curr(cpu_rq(cpu1));
+		resched_curr(cpu_rq(cpu2));
+	}
+	
+	spin_unlock(&entangled_lock);
+}
 
 static int __init sched_fair_sysctl_init(void)
 {
@@ -160,6 +226,120 @@ static int __init sched_fair_sysctl_init(void)
 }
 late_initcall(sched_fair_sysctl_init);
 #endif
+
+
+/*
+ * Check if we need to flip priority between entangled CPUs.
+ * Call this when a CPU would go idle due to entanglement.
+ */
+static void check_entangled_timeout(int cpu)
+{
+	int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	u64 now = ktime_get_ns();
+	u64 last_switch;
+	unsigned int current_priority;
+	
+	/* No entanglement */
+	if (cpu1 == cpu2)
+		return;
+	
+	/* Not an entangled CPU */
+	if (cpu != cpu1 && cpu != cpu2)
+		return;
+	
+	spin_lock(&entangled_lock);
+	
+	last_switch = entangled_last_switch_ns;
+	current_priority = entangled_priority_cpu;
+	
+	/* Check if timeout exceeded */
+	if (now - last_switch >= ENTANGLED_TIMEOUT_NS) {
+		/* Flip priority to the other CPU */
+		if (current_priority == cpu1)
+			entangled_priority_cpu = cpu2;
+		else
+			entangled_priority_cpu = cpu1;
+		
+		entangled_last_switch_ns = now;
+		
+		/* Trigger reschedule on both CPUs to apply new priority */
+		resched_curr(cpu_rq(cpu1));
+		resched_curr(cpu_rq(cpu2));
+	}
+	
+	spin_unlock(&entangled_lock);
+}
+
+/*
+ * Check if task p can run on cpu given entanglement constraints.
+ * Returns true if the task can run, false if it would violate the constraint.
+ */
+static bool can_run_on_entangled_cpu(struct task_struct *p, int cpu)
+{
+	int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	int other_cpu;
+	struct rq *other_rq;
+	struct task_struct *curr_on_other;
+	uid_t my_uid, other_uid;
+	unsigned int priority_cpu;
+	
+	/* No entanglement if both values are the same */
+	if (cpu1 == cpu2)
+		return true;
+	
+	/* Determine if this CPU is entangled and identify the paired CPU */
+	if (cpu == cpu1)
+		other_cpu = cpu2;
+	else if (cpu == cpu2)
+		other_cpu = cpu1;
+	else
+		return true; /* This CPU is not part of the entangled pair */
+	
+	/* Get the runqueue of the other entangled CPU */
+	other_rq = cpu_rq(other_cpu);
+	
+	/* Get currently running task on the other CPU */
+	curr_on_other = other_rq->curr;
+	
+	/* If other CPU is idle, we can run */
+	if (!curr_on_other || is_idle_task(curr_on_other))
+		return true;
+	
+	/* Get UIDs of both tasks */
+	my_uid = from_kuid_munged(&init_user_ns, task_uid(p));
+	other_uid = from_kuid_munged(&init_user_ns, task_uid(curr_on_other));
+	
+	/* If same user, no conflict - can run */
+	if (my_uid == other_uid)
+		return true;
+	
+	/*
+	 * Different users on entangled CPUs - conflict!
+	 * Use priority system: only the priority CPU can run.
+	 */
+	spin_lock(&entangled_lock);
+	priority_cpu = entangled_priority_cpu;
+	spin_unlock(&entangled_lock);
+	
+	/* If this CPU has priority (or priority not set yet), allow it */
+	if (priority_cpu == 0 || priority_cpu == cpu) {
+		/* Initialize priority if not set */
+		if (priority_cpu == 0) {
+			spin_lock(&entangled_lock);
+			if (entangled_priority_cpu == 0) {
+				entangled_priority_cpu = cpu;
+				entangled_last_switch_ns = ktime_get_ns();
+			}
+			spin_unlock(&entangled_lock);
+		}
+		return true;
+	}
+	
+	/* This CPU doesn't have priority - cannot run */
+	return false;
+}
 
 static inline void update_load_add(struct load_weight *lw, unsigned long inc)
 {
@@ -9008,12 +9188,41 @@ again:
 
 		__set_next_task_fair(rq, p, true);
 	}
-
+	if (p && !can_run_on_entangled_cpu(p, cpu_of(rq))) {
+		/*
+		 * Selected task violates entanglement constraint.
+		 * Check if we've been idle too long and need to flip priority.
+		 */
+		check_entangled_timeout(cpu_of(rq));
+		
+		/*
+		 * After checking timeout, try one more time with updated priority.
+		 * If still can't run, goto idle instead.
+		 */
+		if (!can_run_on_entangled_cpu(p, cpu_of(rq)))
+			goto idle;
+	}
 	return p;
 
 simple:
 #endif
 	put_prev_set_next_task(rq, prev, p);
+	
+	/* Check entanglement constraint */
+	if (p && !can_run_on_entangled_cpu(p, cpu_of(rq))) {
+		/*
+		 * Selected task violates entanglement constraint.
+		 * Check if we've been idle too long and need to flip priority.
+		 */
+		check_entangled_timeout(cpu_of(rq));
+		
+		/*
+		 * After checking timeout, try one more time with updated priority.
+		 * If still can't run, goto idle instead.
+		 */
+		if (!can_run_on_entangled_cpu(p, cpu_of(rq)))
+			goto idle;
+	}	
 	return p;
 
 idle:
@@ -13204,6 +13413,11 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	check_update_overutilized_status(task_rq(curr));
 
 	task_tick_core(rq, curr);
+
+	/* Periodically check if we need to flip entangled CPU priority */
+	if (rq->cfs.nr_running > 0) {
+		check_entangled_timeout(cpu_of(rq));
+	}
 }
 
 /*
