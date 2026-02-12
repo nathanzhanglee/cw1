@@ -55,6 +55,9 @@
 #include "stats.h"
 #include "autogroup.h"
 
+#include <linux/cred.h>
+#include <linux/sched/task.h>
+
 /*
  * The initial- and re-scaling of tunables is configurable
  *
@@ -8990,7 +8993,7 @@ bool check_if_safe_to_schedule(struct rq *rq) {
         return true;
     }
 
-    if (current_task->cred->uid.val != other_task->cred->uid.val) {
+    if (!uid_eq(task_uid(current_task), task_uid(other_task))) {
         return false;
     }
 
@@ -9001,8 +9004,8 @@ struct task_struct *
 pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
 
-	int entangled_cpu1 = sysctl_entangled_cpu1;
-	int entangled_cpu2 = sysctl_entangled_cpu2;
+	int entangled_cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int entangled_cpu2 = READ_ONCE(sysctl_entangled_cpu2);
 
 	struct sched_entity *se;
 	struct task_struct *p;
