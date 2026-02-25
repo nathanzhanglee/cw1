@@ -130,6 +130,15 @@ static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 #endif
 
 #ifdef CONFIG_SYSCTL
+static unsigned int sysctl_entangled_cpu1 = 0;
+static unsigned int sysctl_entangled_cpu2 = 0;
+
+static u64 entangled_idle_start[NR_CPUS];
+static unsigned int entangled_priority_cpu = 0;
+
+static bool entangled_should_yield[NR_CPUS];
+
+
 static struct ctl_table sched_fair_sysctls[] = {
 #ifdef CONFIG_CFS_BANDWIDTH
 	{
@@ -151,6 +160,20 @@ static struct ctl_table sched_fair_sysctls[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 #endif /* CONFIG_NUMA_BALANCING */
+	{
+		.procname	= "entangled_cpus_1",
+		.data		= &sysctl_entangled_cpu1,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+	},
+	{
+		.procname	= "entangled_cpus_2",
+		.data		= &sysctl_entangled_cpu2,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+	},
 };
 
 static int __init sched_fair_sysctl_init(void)
@@ -1121,6 +1144,112 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 }
 #endif /* CONFIG_SMP */
 
+/*
+ * Check if other entangled CPU has been idle too long -> flip priority to give it turn if so (UNO REVERSE)
+ */
+static void check_entangled_timeout(int cpu)
+{
+	int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	int other_cpu;
+	u64 now, other_idle_start;
+	
+	if (cpu1 == cpu2)
+		return;
+	
+	if (cpu == cpu1)
+		other_cpu = cpu2;
+	else if (cpu == cpu2)
+		other_cpu = cpu1;
+	else
+		return;
+	
+	if (other_cpu < 0 || other_cpu >= NR_CPUS)
+		return;
+	
+	/* Check if other CPU has been idle-waiting */
+	other_idle_start = entangled_idle_start[other_cpu];
+	if (other_idle_start == 0)
+		return;
+	
+	now = ktime_get_ns();
+	
+	/* Flip priority if other CPU waited > 1 second */
+	if ((now - other_idle_start) > 1000000000ULL) {
+		entangled_priority_cpu = other_cpu;
+		entangled_idle_start[other_cpu] = 0;
+		entangled_idle_start[cpu] = now;
+		
+		/* Mark this CPU to yield immediately */
+		entangled_should_yield[cpu] = true;
+		
+		/* Stop current task to trigger reschedule */
+		resched_curr(cpu_rq(cpu));
+	}
+}
+
+static bool can_run_on_entangled_cpu(struct task_struct *p, int cpu)
+{
+	int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	int other_cpu;
+	struct rq *other_rq;
+	struct task_struct *curr_on_other;
+	uid_t my_uid, other_uid;
+	
+	if (!p)
+		return true;
+	
+	if (cpu1 == cpu2)
+		return true;
+	
+	if (cpu == cpu1)
+		other_cpu = cpu2;
+	else if (cpu == cpu2)
+		other_cpu = cpu1;
+	else
+		return true;
+	
+	if (other_cpu < 0 || other_cpu >= NR_CPUS)
+		return true;
+	
+	other_rq = cpu_rq(other_cpu);
+	if (!other_rq)
+		return true;
+	
+	/* Ensure we see the latest curr value from other CPU */
+	smp_rmb();
+	curr_on_other = READ_ONCE(other_rq->curr);	
+	
+	if (!curr_on_other || is_idle_task(curr_on_other)) {
+		entangled_idle_start[cpu] = 0;
+		return true;
+	}
+	
+	my_uid = from_kuid_munged(&init_user_ns, task_uid(p));
+	other_uid = from_kuid_munged(&init_user_ns, task_uid(curr_on_other));
+	
+	if (my_uid == other_uid) {
+		entangled_idle_start[cpu] = 0;
+		return true;
+	}
+	
+	/* Different users -> check priority */
+	if (entangled_priority_cpu == cpu || entangled_priority_cpu == 0) {
+		/* We have priority or none set */
+		if (entangled_priority_cpu == 0)
+			entangled_priority_cpu = cpu;
+		entangled_idle_start[cpu] = 0;
+		return true;
+	}
+	
+	/* Other CPU has priority, mark ourselves as waiting */
+	if (entangled_idle_start[cpu] == 0)
+		entangled_idle_start[cpu] = ktime_get_ns();
+	
+	return false;
+}
+
 static s64 update_curr_se(struct rq *rq, struct sched_entity *curr)
 {
 	u64 now = rq_clock_task(rq);
@@ -1245,6 +1374,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (resched || did_preempt_short(cfs_rq, curr)) {
 		resched_curr(rq);
 		clear_buddies(cfs_rq, curr);
+	}
+
+	check_entangled_timeout(cpu_of(rq_of(cfs_rq)));
+	
+	/* If we lost priority, yield immediately to reduce overlap */
+	if (entangled_should_yield[cpu_of(rq_of(cfs_rq))]) {
+		entangled_should_yield[cpu_of(rq_of(cfs_rq))] = false;
+		resched_curr(rq_of(cfs_rq));
+		return;
 	}
 }
 
@@ -8948,6 +9086,10 @@ again:
 			goto again;
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
+
+	/* Check entanglement constraint */
+	if (!can_run_on_entangled_cpu(task_of(se), cpu_of(rq)))
+		return NULL;
 
 	return task_of(se);
 }
