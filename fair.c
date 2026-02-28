@@ -1221,7 +1221,8 @@ static bool can_run_on_entangled_cpu(struct task_struct *p, int cpu)
 	smp_rmb();
 	curr_on_other = READ_ONCE(other_rq->curr);	
 	
-	if (!curr_on_other || is_idle_task(curr_on_other)) {
+	/* Ignore idle tasks and kernel threads */
+	if (!curr_on_other || is_idle_task(curr_on_other) || (curr_on_other->flags & PF_KTHREAD)) {
 		entangled_idle_start[cpu] = 0;
 		return true;
 	}
